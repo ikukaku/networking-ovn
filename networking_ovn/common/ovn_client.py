@@ -1578,11 +1578,13 @@ class OVNClient(object):
     def _get_ovn_dhcpv4_opts(self, subnet, network, server_mac=None):
         metadata_port_ip = self._find_metadata_port_ip(
             n_context.get_admin_context(), subnet)
+        dhcp_port_ip = self._get_dhcp_port_ip(
+            n_context.get_admin_context(), subnet)
         # TODO(dongj): Currently the metadata port is created only when
         # ovn_metadata_enabled is true, therefore this is a restriction for
         # supporting DHCP of subnet without gateway IP.
         # We will remove this restriction later.
-        service_id = subnet['gateway_ip'] or metadata_port_ip
+        service_id = dhcp_port_ip or subnet['gateway_ip'] or metadata_port_ip
         if not service_id:
             return {}
 
@@ -1763,6 +1765,10 @@ class OVNClient(object):
             if subnet['ip_version'] == 4:
                 context = n_context.get_admin_context()
                 self.update_metadata_port(context, network['id'])
+                # When a subnet enable_dhcp is true
+                # and metadata-agent service is disabled,
+                # we should create a reserved dhcp port for DHCP service.
+                self._validate_dhcp_port(subnet)
 
             self._add_subnet_dhcp_options(subnet, network)
         db_rev.bump_revision(subnet, ovn_const.TYPE_SUBNETS)
@@ -1782,6 +1788,7 @@ class OVNClient(object):
         if subnet['enable_dhcp'] or ovn_subnet:
             context = n_context.get_admin_context()
             self.update_metadata_port(context, network['id'])
+            self._validate_dhcp_port(subnet, ovn_subnet)
 
         check_rev_cmd = self._nb_idl.check_revision_number(
             subnet['id'], subnet, ovn_const.TYPE_SUBNETS)
@@ -1875,6 +1882,66 @@ class OVNClient(object):
     def delete_security_group_rule(self, rule):
         self._process_security_group_rule(rule, is_add_acl=False)
         db_rev.delete_revision(rule['id'], ovn_const.TYPE_SECURITY_GROUP_RULES)
+
+    def _get_dhcp_port(self, context, subnet):
+        dhcp_ports = self._plugin.get_ports(context, filters={
+            'device_id': [const.DEVICE_ID_RESERVED_DHCP_PORT],
+            'device_owner': [const.DEVICE_OWNER_DHCP]})
+        return dhcp_ports[0] if dhcp_ports else {}
+
+    def _get_dhcp_port_ip(self, context, subnet):
+        dhcp_port = self._get_dhcp_port(context, subnet)
+        for fixed_ip in dhcp_port.get('fixed_ips', []):
+            if fixed_ip['subnet_id'] == subnet['id']:
+                return fixed_ip['ip_address']
+        return ''
+
+    def _validate_dhcp_port(self, subnet, ori_subnet_dhcp_option=None):
+        if not subnet['ip_version'] == const.IP_VERSION_4:
+            return
+        if subnet['enable_dhcp'] and not ori_subnet_dhcp_option:
+            create = True
+        elif not subnet['enable_dhcp'] and ori_subnet_dhcp_option:
+            create = False
+        else:
+            return
+
+        ctx = n_context.get_admin_context()
+        if self._find_metadata_port(ctx, subnet['network_id']):
+            return
+        if create:
+            self._create_dhcp_port(ctx, subnet)
+        else:
+            self._delete_dhcp_port(ctx, subnet)
+
+    def _create_dhcp_port(self, context, subnet):
+        port_dict = {
+            'tenant_id': '',  # tenant intentionally not set
+            'name': '',
+            'security_groups': [],
+            'admin_state_up': False,
+            'device_id': const.DEVICE_ID_RESERVED_DHCP_PORT,
+            'device_owner': const.DEVICE_OWNER_DHCP,
+            'network_id': subnet['network_id'],
+            'mac_address': const.ATTR_NOT_SPECIFIED,
+            'fixed_ips': [{'subnet_id': subnet['id']}]}
+        try:
+            self._plugin.create_port(context, {'port': port_dict})
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.error('Create DHCP port for subnet %s failed',
+                          subnet['id'])
+
+    def _delete_dhcp_port(self, context, subnet):
+        dhcp_port = self._get_dhcp_port(context, subnet)
+        if dhcp_port:
+            try:
+                self._plugin.delete_port(context, dhcp_port['id'])
+            except Exception:
+                LOG.error('Delete DHCP port %(port)s for '
+                          'subnet %(subnet)s failed',
+                          {'port': dhcp_port['id'],
+                           'subnet': subnet['id']})
 
     def _find_metadata_port(self, context, network_id):
         if not config.is_ovn_metadata_enabled():
